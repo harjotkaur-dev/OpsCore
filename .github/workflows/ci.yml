@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main, develop]
 
+# ---------------------------------------------------------------------------
+# Reusable step: generate ephemeral RSA keys when secrets are not configured.
+# This keeps CI green for contributors who don't have access to repo secrets.
+# ---------------------------------------------------------------------------
+
 jobs:
   # ---------------------------------------------------------------------------
   # Unit Tests (API + Worker)
@@ -13,6 +18,17 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
+    env:
+      # Minimal env for @opscore/config Zod parse at module load.
+      # Unit tests mock all external services — these values are never used for real I/O.
+      NODE_ENV: test
+      DATABASE_URL: postgresql://opscore:opscore_dev@localhost:5432/opscore_dev
+      REDIS_URL: redis://localhost:6379
+      LOG_LEVEL: warn
+      COOKIE_SECRET: test-cookie-secret-32-chars-long!!
+      CORS_ORIGIN: http://localhost:5173
+      PORT: 3001
+
     steps:
       - uses: actions/checkout@v4
 
@@ -21,6 +37,19 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
+
+      - name: Generate test JWT keys
+        # Always generate fresh keys — unit tests mock JWT anyway,
+        # but @opscore/config requires non-empty valid PEM strings at startup.
+        run: |
+          openssl genrsa -out /tmp/test-private.pem 2048 2>/dev/null
+          openssl rsa -in /tmp/test-private.pem -pubout -out /tmp/test-public.pem 2>/dev/null
+          echo "JWT_PRIVATE_KEY<<PEMEOF" >> $GITHUB_ENV
+          cat /tmp/test-private.pem >> $GITHUB_ENV
+          echo "PEMEOF" >> $GITHUB_ENV
+          echo "JWT_PUBLIC_KEY<<PEMEOF" >> $GITHUB_ENV
+          cat /tmp/test-public.pem >> $GITHUB_ENV
+          echo "PEMEOF" >> $GITHUB_ENV
 
       - name: Install dependencies
         run: npm ci
@@ -31,6 +60,9 @@ jobs:
           npm run build --workspace=@opscore/logger
           npm run build --workspace=@opscore/types
           npm run build --workspace=@opscore/database
+
+      - name: Generate Prisma client
+        run: npx prisma generate --schema=packages/database/prisma/schema.prisma
 
       - name: Run API unit tests
         run: npm test --workspace=@opscore/api
@@ -75,8 +107,6 @@ jobs:
       REDIS_URL: redis://localhost:6379
       NODE_ENV: test
       LOG_LEVEL: warn
-      JWT_PRIVATE_KEY: ${{ secrets.JWT_PRIVATE_KEY }}
-      JWT_PUBLIC_KEY: ${{ secrets.JWT_PUBLIC_KEY }}
       COOKIE_SECRET: test-cookie-secret-32-chars-long!!
       CORS_ORIGIN: http://localhost:5173
       PORT: 3001
@@ -90,6 +120,17 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
+      - name: Generate test JWT keys
+        run: |
+          openssl genrsa -out /tmp/test-private.pem 2048 2>/dev/null
+          openssl rsa -in /tmp/test-private.pem -pubout -out /tmp/test-public.pem 2>/dev/null
+          echo "JWT_PRIVATE_KEY<<PEMEOF" >> $GITHUB_ENV
+          cat /tmp/test-private.pem >> $GITHUB_ENV
+          echo "PEMEOF" >> $GITHUB_ENV
+          echo "JWT_PUBLIC_KEY<<PEMEOF" >> $GITHUB_ENV
+          cat /tmp/test-public.pem >> $GITHUB_ENV
+          echo "PEMEOF" >> $GITHUB_ENV
+
       - name: Install dependencies
         run: npm ci
 
@@ -99,6 +140,9 @@ jobs:
           npm run build --workspace=@opscore/logger
           npm run build --workspace=@opscore/types
           npm run build --workspace=@opscore/database
+
+      - name: Generate Prisma client
+        run: npx prisma generate --schema=packages/database/prisma/schema.prisma
 
       - name: Create test database
         run: |
@@ -119,16 +163,16 @@ jobs:
     runs-on: ubuntu-latest
     needs: [unit-tests]
 
-    env:
-      JWT_PRIVATE_KEY: ${{ secrets.JWT_PRIVATE_KEY }}
-      JWT_PUBLIC_KEY: ${{ secrets.JWT_PUBLIC_KEY }}
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create .env for docker compose
+      - name: Generate JWT keys and write .env
         run: |
-          cat > .env << 'ENVEOF'
+          openssl genrsa -out /tmp/ci-private.pem 2048 2>/dev/null
+          openssl rsa -in /tmp/ci-private.pem -pubout -out /tmp/ci-public.pem 2>/dev/null
+
+          # Write the .env file that docker compose will use
+          cat > .env <<'ENVEOF'
           NODE_ENV=production
           DATABASE_URL=postgresql://opscore:opscore_dev@postgres:5432/opscore_dev
           REDIS_URL=redis://redis:6379
@@ -140,8 +184,10 @@ jobs:
           WORKER_CONCURRENCY_NOTIFICATIONS=2
           WORKER_CONCURRENCY_METRICS=2
           ENVEOF
-          echo "JWT_PRIVATE_KEY=${{ secrets.JWT_PRIVATE_KEY }}" >> .env
-          echo "JWT_PUBLIC_KEY=${{ secrets.JWT_PUBLIC_KEY }}" >> .env
+
+          # Append keys (inline newlines for docker compose env file format)
+          printf 'JWT_PRIVATE_KEY="%s"\n' "$(awk '{printf "%s\\n", $0}' /tmp/ci-private.pem)" >> .env
+          printf 'JWT_PUBLIC_KEY="%s"\n' "$(awk '{printf "%s\\n", $0}' /tmp/ci-public.pem)" >> .env
 
       - name: Build and start stack
         run: docker compose up -d --build
@@ -149,9 +195,9 @@ jobs:
       - name: Wait for stack to be ready
         run: |
           for i in $(seq 1 30); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health || echo "000")
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health 2>/dev/null || echo "000")
             if [ "$STATUS" = "200" ]; then
-              echo "Stack ready after ${i}s"
+              echo "Stack ready after $((i * 2))s"
               exit 0
             fi
             sleep 2

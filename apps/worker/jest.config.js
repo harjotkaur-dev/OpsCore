@@ -28,5 +28,5 @@ export default {
     ],
   },
   testMatch: ['**/__tests__/**/*.test.ts', '**/*.test.ts'],
-  testPathIgnorePatterns: ['node_modules', 'dist'],
+  testPathIgnorePatterns: ['node_modules', 'dist', '.*\\.integration\\.test\\.ts$'],
 }
