@@ -1,0 +1,38 @@
+{
+  "name": "@opscore/worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "dev": "node --env-file=../../.env --import tsx/esm --watch src/main.ts",
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts",
+    "test": "node --experimental-vm-modules ../../node_modules/.bin/jest",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
+  },
+  "dependencies": {
+    "@opscore/config": "*",
+    "@opscore/database": "*",
+    "@opscore/logger": "*",
+    "@opscore/types": "*",
+    "bullmq": "5.7.8",
+    "ioredis": "5.3.2",
+    "mustache": "^4.2.0",
+    "node-fetch": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/mustache": "^4.2.5",
+    "@types/node": "20.12.12",
+    "@types/node-fetch": "^2.6.11",
+    "@vitest/coverage-v8": "^2.1.9",
+    "jest": "^30.4.2",
+    "ts-jest": "^29.4.11",
+    "tsx": "4.11.0",
+    "typescript": "5.4.5",
+    "vitest": "^2.1.9"
+  }
+}

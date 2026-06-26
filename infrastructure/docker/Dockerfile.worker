@@ -1,0 +1,84 @@
+# ------------------------
+# Base
+# ------------------------
+FROM node:20-alpine AS base
+WORKDIR /app
+RUN corepack enable && apk add --no-cache openssl
+
+
+# ------------------------
+# Dependencies
+# ------------------------
+FROM base AS deps
+
+COPY package.json package-lock.json ./
+
+COPY apps/worker/package.json ./apps/worker/
+COPY packages/config/package.json ./packages/config/
+COPY packages/database/package.json ./packages/database/
+COPY packages/logger/package.json ./packages/logger/
+COPY packages/types/package.json ./packages/types/
+
+# Install FULL workspace (important for monorepo)
+RUN npm ci
+
+
+# ------------------------
+# Builder
+# ------------------------
+FROM base AS builder
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# Build shared packages first
+RUN npm run build --workspace=@opscore/config
+RUN npm run build --workspace=@opscore/logger
+RUN npm run build --workspace=@opscore/types
+RUN npm run build --workspace=@opscore/database
+
+# Prisma generate (important fix)
+RUN npx prisma generate --schema=packages/database/prisma/schema.prisma
+
+# Build worker
+RUN npm run build --workspace=@opscore/worker
+
+
+# ------------------------
+# Runner (PRODUCTION)
+# ------------------------
+FROM node:20-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+# Install OpenSSL (required by Prisma query engine)
+RUN apk add --no-cache openssl
+
+# Copy root package.json for workspace awareness
+COPY package.json package-lock.json ./
+
+# Copy workspace package manifests (needed for symlink resolution)
+COPY apps/worker/package.json ./apps/worker/
+COPY packages/config/package.json ./packages/config/
+COPY packages/database/package.json ./packages/database/
+COPY packages/logger/package.json ./packages/logger/
+COPY packages/types/package.json ./packages/types/
+
+# Install production deps (includes workspace symlinks)
+RUN npm ci --omit=dev
+
+# Copy built output
+COPY --from=builder /app/apps/worker/dist ./apps/worker/dist
+
+# Copy built workspace packages (their dist folders must exist for imports to work)
+COPY --from=builder /app/packages/config/dist ./packages/config/dist
+COPY --from=builder /app/packages/logger/dist ./packages/logger/dist
+COPY --from=builder /app/packages/types/dist ./packages/types/dist
+COPY --from=builder /app/packages/database/dist ./packages/database/dist
+
+# Copy generated Prisma client
+COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=builder /app/node_modules/@prisma/client ./node_modules/@prisma/client
+
+CMD ["node", "apps/worker/dist/main.js"]

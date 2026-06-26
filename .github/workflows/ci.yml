@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Unit Tests (API + Worker)
+  # ---------------------------------------------------------------------------
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build shared packages
+        run: |
+          npm run build --workspace=@opscore/config
+          npm run build --workspace=@opscore/logger
+          npm run build --workspace=@opscore/types
+          npm run build --workspace=@opscore/database
+
+      - name: Run API unit tests
+        run: npm test --workspace=@opscore/api
+
+      - name: Run Worker unit tests
+        run: npm test --workspace=@opscore/worker
+
+  # ---------------------------------------------------------------------------
+  # Integration Tests (API + Worker — requires real Postgres + Redis)
+  # ---------------------------------------------------------------------------
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: opscore
+          POSTGRES_PASSWORD: opscore_dev
+          POSTGRES_DB: opscore_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U opscore -d opscore_dev"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://opscore:opscore_dev@localhost:5432/opscore_dev
+      TEST_DATABASE_URL: postgresql://opscore:opscore_dev@localhost:5432/opscore_test
+      REDIS_URL: redis://localhost:6379
+      NODE_ENV: test
+      LOG_LEVEL: warn
+      JWT_PRIVATE_KEY: ${{ secrets.JWT_PRIVATE_KEY }}
+      JWT_PUBLIC_KEY: ${{ secrets.JWT_PUBLIC_KEY }}
+      COOKIE_SECRET: test-cookie-secret-32-chars-long!!
+      CORS_ORIGIN: http://localhost:5173
+      PORT: 3001
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build shared packages
+        run: |
+          npm run build --workspace=@opscore/config
+          npm run build --workspace=@opscore/logger
+          npm run build --workspace=@opscore/types
+          npm run build --workspace=@opscore/database
+
+      - name: Create test database
+        run: |
+          PGPASSWORD=opscore_dev psql -h localhost -U opscore -d opscore_dev \
+            -c "SELECT 'CREATE DATABASE opscore_test OWNER opscore' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='opscore_test')\gexec"
+
+      - name: Run API integration tests
+        run: npm run test:integration --workspace=@opscore/api
+
+      - name: Run Worker integration tests
+        run: npm run test:integration --workspace=@opscore/worker
+
+  # ---------------------------------------------------------------------------
+  # Docker Smoke Test (full stack)
+  # ---------------------------------------------------------------------------
+  smoke-test:
+    name: Docker Smoke Test
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+
+    env:
+      JWT_PRIVATE_KEY: ${{ secrets.JWT_PRIVATE_KEY }}
+      JWT_PUBLIC_KEY: ${{ secrets.JWT_PUBLIC_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env for docker compose
+        run: |
+          cat > .env << 'ENVEOF'
+          NODE_ENV=production
+          DATABASE_URL=postgresql://opscore:opscore_dev@postgres:5432/opscore_dev
+          REDIS_URL=redis://redis:6379
+          COOKIE_SECRET=ci-smoke-test-secret-32-chars-xx
+          CORS_ORIGIN=http://localhost:8080
+          PORT=3000
+          LOG_LEVEL=warn
+          WORKER_CONCURRENCY_WORKFLOW=2
+          WORKER_CONCURRENCY_NOTIFICATIONS=2
+          WORKER_CONCURRENCY_METRICS=2
+          ENVEOF
+          echo "JWT_PRIVATE_KEY=${{ secrets.JWT_PRIVATE_KEY }}" >> .env
+          echo "JWT_PUBLIC_KEY=${{ secrets.JWT_PUBLIC_KEY }}" >> .env
+
+      - name: Build and start stack
+        run: docker compose up -d --build
+
+      - name: Wait for stack to be ready
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "Stack ready after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Stack not ready after 60s"
+          docker compose logs
+          exit 1
+
+      - name: Run smoke tests
+        run: bash scripts/smoke-test.sh
+
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          echo "=== API logs ==="
+          docker compose logs api --tail=50
+          echo "=== Worker logs ==="
+          docker compose logs worker --tail=30
+
+      - name: Tear down
+        if: always()
+        run: docker compose down
